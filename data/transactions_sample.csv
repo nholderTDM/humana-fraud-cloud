@@ -1,0 +1,6 @@
+transaction_id,amount,location,device
+TXN10001,25000,USA,Web
+TXN10002,75,USA,Mobile
+TXN10003,12000,CAN,Web
+TXN10004,45,USA,Mobile
+TXN10005,18000,USA,Web
