@@ -55,16 +55,14 @@ def health():
 
 @app.post("/transactions")
 def enqueue_transaction(txn: Transaction, x_api_token: Optional[str] = Header(default=None, alias="X-API-TOKEN")):
-    """
-    POST a single transaction.
-    Optional header auth: X-API-TOKEN must match API_TOKEN if API_TOKEN is set.
-    """
     if API_TOKEN and x_api_token != API_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     try:
-        from fastapi.encoders import jsonable_encoder
-        r.rpush(QUEUE_NAME, json.dumps(jsonable_encoder(txn)))
+        # Convert Decimal to float for JSON serialization
+        payload = txn.dict()
+        payload["amount"] = float(payload["amount"])
+        r.rpush(QUEUE_NAME, json.dumps(payload))
         return {"status": "enqueued", "queue": QUEUE_NAME, "transaction_id": txn.transaction_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -72,16 +70,15 @@ def enqueue_transaction(txn: Transaction, x_api_token: Optional[str] = Header(de
 
 @app.post("/transactions/batch")
 def enqueue_batch(txns: list[Transaction], x_api_token: Optional[str] = Header(default=None, alias="X-API-TOKEN")):
-    """
-    POST a batch of transactions (array of Transaction).
-    """
     if API_TOKEN and x_api_token != API_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     try:
         pipe = r.pipeline()
         for t in txns:
-        pipe.rpush(QUEUE_NAME, json.dumps(jsonable_encoder(t)))
+            payload = t.dict()
+            payload["amount"] = float(payload["amount"])
+            pipe.rpush(QUEUE_NAME, json.dumps(payload))
         pipe.execute()
         return {"status": "enqueued", "queue": QUEUE_NAME, "count": len(txns)}
     except Exception as e:
