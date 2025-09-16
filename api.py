@@ -43,6 +43,14 @@ class Transaction(BaseModel):
 # --------- app init ---------------
 app = FastAPI(title="Fraud Ingestion API", version="1.0.0")
 
+@app.on_event("startup")
+async def startup_event():
+    try:
+        app.state.redis = Redis.from_url(os.getenv("REDIS_URL"))
+        logger.info("✅ Successfully connected to Redis")
+    except Exception as e:
+        logger.error(f"❌ Error connecting to Redis: {e}")
+        raise
 
 @app.get("/")
 def health():
