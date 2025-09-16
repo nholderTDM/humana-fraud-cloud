@@ -1,94 +1,68 @@
 """
-api.py
-------
-Minimal FastAPI service that accepts transactions and enqueues them in Redis.
-The fraud batch pipeline (GitHub Actions) will drain the queue on the next run.
-
-Env vars required in hosting platform (Railway):
-  REDIS_URL   -> e.g., rediss://:<PASSWORD>@<HOST>:<PORT
-Optional env vars:
+Minimal FastAPI service to enqueue transactions in Redis.
+Env vars required:
+  REDIS_URL   -> e.g. redis://:<PASSWORD>@<HOST>:<PORT>
+Optional:
   QUEUE_NAME  -> default "transactions_queue"
-  API_TOKEN   -> if set, clients must provide header 'X-API-TOKEN: <token>'
+  API_TOKEN   -> if set, header 'X-API-TOKEN' must match
 """
 
 import os
 import json
-from typing import Optional
+from typing import Optional, List
+from decimal import Decimal
 
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel, Field, condecimal
 import redis
 
-
-# --------- configuration ----------
-REDIS_URL = os.getenv("REDIS_URL")
+# -------- Configuration --------
+REDIS_URL  = os.getenv("REDIS_URL")
 QUEUE_NAME = os.getenv("QUEUE_NAME", "transactions_queue")
+API_TOKEN  = os.getenv("API_TOKEN")
 
 if not REDIS_URL:
     raise RuntimeError("REDIS_URL is not set. Configure it in Railway env vars.")
 
-print(f">>> DEBUG: REDIS_URL = {REDIS_URL}")
+r = redis.from_url(REDIS_URL, decode_responses=True)  # handles redis:// or rediss://
 
-r = redis.from_url(REDIS_URL, decode_responses=True)  # decode strings, use TLS with rediss://
-
-
-# --------- pydantic models --------
+# -------- Data model ----------
 class Transaction(BaseModel):
     transaction_id: str = Field(..., min_length=3)
-    amount: condecimal(gt=0)  # positive amount
+    amount: condecimal(gt=0)   # positive number
     location: Optional[str] = "USA"
-    device: Optional[str] = "Web"
+    device:   Optional[str] = "Web"
 
-
-# --------- app init ---------------
+# -------- FastAPI app ---------
 app = FastAPI(title="Fraud Ingestion API", version="1.0.0")
-
-@app.on_event("startup")
-async def startup_event():
-    try:
-        app.state.redis = Redis.from_url(os.getenv("REDIS_URL"))
-        logger.info("✅ Successfully connected to Redis")
-    except Exception as e:
-        logger.error(f"❌ Error connecting to Redis: {e}")
-        raise
 
 @app.get("/")
 def health():
-    """Simple health check."""
     try:
         r.ping()
         return {"ok": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Redis not reachable: {e}")
 
-
 @app.post("/transactions")
-def enqueue_transaction(txn: Transaction, x_api_token: Optional[str] = Header(default=None, alias="X-API-TOKEN")):
+def enqueue_transaction(txn: Transaction, x_api_token: Optional[str] = Header(None, alias="X-API-TOKEN")):
     if API_TOKEN and x_api_token != API_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    try:
-        # Convert Decimal to float for JSON serialization
-        payload = txn.dict()
-        payload["amount"] = float(payload["amount"])
-        r.rpush(QUEUE_NAME, json.dumps(payload))
-        return {"status": "enqueued", "queue": QUEUE_NAME, "transaction_id": txn.transaction_id}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
+    payload = txn.dict()
+    payload["amount"] = float(payload["amount"])  # convert Decimal
+    r.rpush(QUEUE_NAME, json.dumps(payload))
+    return {"status": "enqueued", "queue": QUEUE_NAME, "transaction_id": txn.transaction_id}
 
 @app.post("/transactions/batch")
-def enqueue_batch(txns: list[Transaction], x_api_token: Optional[str] = Header(default=None, alias="X-API-TOKEN")):
+def enqueue_batch(txns: List[Transaction], x_api_token: Optional[str] = Header(None, alias="X-API-TOKEN")):
     if API_TOKEN and x_api_token != API_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    try:
-        pipe = r.pipeline()
-        for t in txns:
-            payload = t.dict()
-            payload["amount"] = float(payload["amount"])
-            pipe.rpush(QUEUE_NAME, json.dumps(payload))
-        pipe.execute()
-        return {"status": "enqueued", "queue": QUEUE_NAME, "count": len(txns)}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    pipe = r.pipeline()
+    for t in txns:
+        payload = t.dict()
+        payload["amount"] = float(payload["amount"])
+        pipe.rpush(QUEUE_NAME, json.dumps(payload))
+    pipe.execute()
+    return {"status": "enqueued", "queue": QUEUE_NAME, "count": len(txns)}
