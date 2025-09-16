@@ -1,38 +1,42 @@
 """
-pipeline.py
-------------
+pipeline.py (queue-aware)
+-------------------------
 End-to-end fraud detection pipeline:
- • Connects to Neon Postgres using NEON_CONN
+ • Connects to Neon Postgres using NEON_CONN (from GitHub Actions secret)
  • Ensures the fraud_alerts table exists (idempotent)
- • Loads transactions (from CSV if present, otherwise synthetic)
- • Flags suspicious transactions (amount >= 10,000)
+ • Optionally drains Redis queue (if REDIS_URL is set)
+ • Loads transactions (CSV if present, else synthetic)
+ • Flags suspicious transactions (amount >= 10,000, risk_score=90)
  • Inserts alerts into the database using ON CONFLICT DO NOTHING
 """
 
 import os
 import sys
 import time
+import json
 from typing import List, Dict
 
 import psycopg2
 import psycopg2.extras
 import pandas as pd
 
-# --- 1. Configuration ---------------------------------------------------------
-NEON_CONN = os.getenv("NEON_CONN")  # GitHub Actions secret
+
+# --- 1. Config ---------------------------------------------------------------
+NEON_CONN = os.getenv("NEON_CONN")
 if not NEON_CONN:
     print("ERROR: NEON_CONN environment variable is missing.")
     sys.exit(1)
 
-CSV_PATH = "data/transactions_sample.csv"  # optional CSV file
+CSV_PATH = "data/transactions_sample.csv"  # optional
+REDIS_URL = os.getenv("REDIS_URL")         # only needed if using the queue
+QUEUE_NAME = os.getenv("QUEUE_NAME", "transactions_queue")
+
 
 # --- 2. Database helpers ------------------------------------------------------
 def get_conn():
-    """Establish a secure SSL connection to Neon Postgres."""
     return psycopg2.connect(NEON_CONN, sslmode="require")
 
 def ensure_schema(conn):
-    """Create the fraud_alerts table and unique index if they don't exist."""
     with conn, conn.cursor() as cur:
         cur.execute("""
             CREATE TABLE IF NOT EXISTS fraud_alerts (
@@ -49,22 +53,43 @@ def ensure_schema(conn):
               ON fraud_alerts (transaction_id);
         """)
 
-# --- 3. Data loading ----------------------------------------------------------
-def load_transactions() -> pd.DataFrame:
-    """
-    Load transactions from CSV if present; otherwise generate synthetic demo data.
-    Required columns: transaction_id, amount
-    """
+
+# --- 3. Optional queue drain --------------------------------------------------
+def drain_queue() -> pd.DataFrame:
+    """Return a DataFrame of queued transactions, or empty DF if none or no REDIS_URL."""
+    if not REDIS_URL:
+        return pd.DataFrame(columns=["transaction_id", "amount", "location", "device"])
+
+    print(f"Draining Redis queue '{QUEUE_NAME}'...")
+    import redis  # lazy import
+    r = redis.from_url(REDIS_URL, decode_responses=True)
+    drained = []
+    # Drain up to a sensible cap per run to avoid huge batches on free tiers
+    max_to_drain = 5000
+    for _ in range(max_to_drain):
+        item = r.lpop(QUEUE_NAME)
+        if item is None:
+            break
+        obj = json.loads(item)
+        drained.append(obj)
+
+    print(f"Drained {len(drained)} queued transactions.")
+    if not drained:
+        return pd.DataFrame(columns=["transaction_id", "amount", "location", "device"])
+    return pd.DataFrame(drained)
+
+
+# --- 4. Data loading ----------------------------------------------------------
+def load_file_or_synthetic() -> pd.DataFrame:
     if os.path.exists(CSV_PATH):
         print(f"Loading transactions from {CSV_PATH}")
         df = pd.read_csv(CSV_PATH)
-        required_cols = {"transaction_id", "amount"}
-        missing = required_cols - set(df.columns)
+        required = {"transaction_id", "amount"}
+        missing = required - set(df.columns)
         if missing:
             raise ValueError(f"CSV missing required columns: {missing}")
         return df
 
-    # No CSV present → create synthetic sample
     print("No CSV found. Generating synthetic transactions...")
     base_id = int(time.time())
     synthetic: List[Dict] = []
@@ -81,13 +106,9 @@ def load_transactions() -> pd.DataFrame:
         })
     return pd.DataFrame(synthetic)
 
-# --- 4. Fraud detection -------------------------------------------------------
+
+# --- 5. Fraud detection -------------------------------------------------------
 def detect_fraud(df: pd.DataFrame) -> List[Dict]:
-    """
-    Simple fraud logic:
-     - Flag any transaction with amount >= 10,000
-     - Assign a high risk score (90)
-    """
     alerts: List[Dict] = []
     for _, r in df.iterrows():
         amt = float(r["amount"])
@@ -100,12 +121,9 @@ def detect_fraud(df: pd.DataFrame) -> List[Dict]:
             })
     return alerts
 
-# --- 5. Insert alerts ---------------------------------------------------------
+
+# --- 6. Insert alerts ---------------------------------------------------------
 def write_alerts(conn, alerts: List[Dict]) -> int:
-    """
-    Insert detected fraud alerts into Neon.
-    Uses ON CONFLICT DO NOTHING to avoid duplicates.
-    """
     if not alerts:
         return 0
     with conn, conn.cursor() as cur:
@@ -121,7 +139,8 @@ def write_alerts(conn, alerts: List[Dict]) -> int:
         )
     return len(alerts)
 
-# --- 6. Main execution --------------------------------------------------------
+
+# --- 7. Main ------------------------------------------------------------------
 def main():
     print("Connecting to Neon...")
     conn = get_conn()
@@ -129,9 +148,11 @@ def main():
         print("Ensuring schema...")
         ensure_schema(conn)
 
-        print("Loading transactions...")
-        df = load_transactions()
-        print(f"Loaded {len(df)} transactions")
+        # Drain queue first (if enabled), then merge with file/synthetic
+        qdf = drain_queue()
+        base = load_file_or_synthetic()
+        df = pd.concat([qdf, base], ignore_index=True) if not qdf.empty else base
+        print(f"Total transactions to evaluate: {len(df)}")
 
         print("Detecting fraud...")
         alerts = detect_fraud(df)
@@ -144,6 +165,6 @@ def main():
         conn.close()
     print("Pipeline run complete.")
 
-# Run as a script
+
 if __name__ == "__main__":
     main()
