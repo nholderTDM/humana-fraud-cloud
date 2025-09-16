@@ -23,12 +23,11 @@ import redis
 # --------- configuration ----------
 REDIS_URL = os.getenv("REDIS_URL")
 QUEUE_NAME = os.getenv("QUEUE_NAME", "transactions_queue")
-API_TOKEN = os.getenv("API_TOKEN")  # optional auth
-
-print(">>> DEBUG: REDIS_URL =", REDIS_URL)
 
 if not REDIS_URL:
     raise RuntimeError("REDIS_URL is not set. Configure it in Railway env vars.")
+
+print(f">>> DEBUG: REDIS_URL = {REDIS_URL}")
 
 r = redis.from_url(REDIS_URL, decode_responses=True)  # decode strings, use TLS with rediss://
 
