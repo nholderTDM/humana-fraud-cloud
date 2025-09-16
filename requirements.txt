@@ -1,3 +1,7 @@
 psycopg2-binary
 pandas
 streamlit
+fastapi
+uvicorn[standard]
+redis
+pydantic
