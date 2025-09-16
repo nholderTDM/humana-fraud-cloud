@@ -63,7 +63,8 @@ def enqueue_transaction(txn: Transaction, x_api_token: Optional[str] = Header(de
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     try:
-        r.rpush(QUEUE_NAME, json.dumps(txn.dict()))
+        from fastapi.encoders import jsonable_encoder
+        r.rpush(QUEUE_NAME, json.dumps(jsonable_encoder(txn)))
         return {"status": "enqueued", "queue": QUEUE_NAME, "transaction_id": txn.transaction_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -80,7 +81,7 @@ def enqueue_batch(txns: list[Transaction], x_api_token: Optional[str] = Header(d
     try:
         pipe = r.pipeline()
         for t in txns:
-            pipe.rpush(QUEUE_NAME, json.dumps(t.dict()))
+        pipe.rpush(QUEUE_NAME, json.dumps(jsonable_encoder(t)))
         pipe.execute()
         return {"status": "enqueued", "queue": QUEUE_NAME, "count": len(txns)}
     except Exception as e:
