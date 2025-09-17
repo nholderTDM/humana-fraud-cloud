@@ -121,14 +121,16 @@ st.subheader("Fraud Alerts Over Time")
 if not alerts_df.empty:
     tmp = alerts_df.copy()
     tmp["bucket"] = tmp["created_at"].dt.floor("H")
+    # rename the count column exactly as used in Altair encodings
     grouped = tmp.groupby("bucket").size().reset_index(name="No. Transactions")
     chart = (
         alt.Chart(grouped)
         .mark_area()
         .encode(
             x=alt.X("bucket:T", title="Time"),
-            y=alt.Y("Count:Q", title="No. Transactions"),
-            tooltip=["bucket:T", "No. Transactions:Q"],
+            y=alt.Y("No. Transactions:Q", title="No. Transactions"),
+            tooltip=[alt.Tooltip("bucket:T", title="Time"),
+                     alt.Tooltip("No. Transactions:Q", title="No. Transactions")],
         )
     )
     st.altair_chart(chart, use_container_width=True)
