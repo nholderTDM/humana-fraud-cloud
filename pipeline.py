@@ -19,20 +19,18 @@ import pandas as pd
 
 NEON_CONN = os.getenv("NEON_CONN")
 if not NEON_CONN:
-    print("ERROR: NEON_CONN environment variable is missing.")
+    print("ERROR: NEON_CONN is missing.")
     sys.exit(1)
 
-CSV_PATH = "data/transactions_sample.csv"
-REDIS_URL = os.getenv("REDIS_URL")
+CSV_PATH   = "data/transactions_sample.csv"
+REDIS_URL  = os.getenv("REDIS_URL")
 QUEUE_NAME = os.getenv("QUEUE_NAME", "transactions_queue")
-
 
 def get_conn():
     return psycopg2.connect(NEON_CONN, sslmode="require")
 
 def ensure_schema(conn):
     with conn, conn.cursor() as cur:
-        # store ALL transactions
         cur.execute("""
             CREATE TABLE IF NOT EXISTS transactions_all (
               transaction_id TEXT PRIMARY KEY,
@@ -45,7 +43,6 @@ def ensure_schema(conn):
               flagged_reason TEXT
             );
         """)
-        # store only fraudulent ones
         cur.execute("""
             CREATE TABLE IF NOT EXISTS fraud_alerts (
               alert_id SERIAL PRIMARY KEY,
@@ -68,22 +65,21 @@ def drain_queue() -> pd.DataFrame:
         if item is None:
             break
         drained.append(json.loads(item))
-    return pd.DataFrame(drained) if drained else pd.DataFrame(
-        columns=["transaction_id","amount","location","device"])
+    return pd.DataFrame(drained) if drained else pd.DataFrame(columns=["transaction_id","amount","location","device"])
 
 def load_file_or_synthetic() -> pd.DataFrame:
     if os.path.exists(CSV_PATH):
         return pd.read_csv(CSV_PATH)
     base_id = int(time.time())
-    rows=[]
+    out = []
     for i in range(1,51):
-        rows.append({
+        out.append({
             "transaction_id": f"TXN{base_id+i}",
             "amount": float(25*i if i%7 else 25000),
             "location": "USA" if i%3 else "CAN",
             "device": "Web" if i%2 else "Mobile"
         })
-    return pd.DataFrame(rows)
+    return pd.DataFrame(out)
 
 def main():
     conn = get_conn()
@@ -103,32 +99,34 @@ def main():
                 risk   = 90 if flagged else None
                 reason = "high_amount" if flagged else None
 
-                # Upsert into transactions_all
+                # upsert ALL transactions
                 cur.execute("""
-                  INSERT INTO transactions_all
-                    (transaction_id, amount, location, device,
-                     processed_at, is_flagged, risk_score, flagged_reason)
-                  VALUES (%s,%s,%s,%s,NOW(),%s,%s,%s)
-                  ON CONFLICT (transaction_id) DO UPDATE
-                    SET amount=EXCLUDED.amount,
-                        location=EXCLUDED.location,
-                        device=EXCLUDED.device,
-                        processed_at=EXCLUDED.processed_at,
-                        is_flagged=EXCLUDED.is_flagged,
-                        risk_score=EXCLUDED.risk_score,
-                        flagged_reason=EXCLUDED.flagged_reason;
-                """,(tid,amt,loc,dev,flagged,risk,reason))
+                    INSERT INTO transactions_all
+                        (transaction_id, amount, location, device,
+                         processed_at, is_flagged, risk_score, flagged_reason)
+                    VALUES (%s,%s,%s,%s,NOW(),%s,%s,%s)
+                    ON CONFLICT (transaction_id) DO UPDATE
+                       SET amount=EXCLUDED.amount,
+                           location=EXCLUDED.location,
+                           device=EXCLUDED.device,
+                           processed_at=EXCLUDED.processed_at,
+                           is_flagged=EXCLUDED.is_flagged,
+                           risk_score=EXCLUDED.risk_score,
+                           flagged_reason=EXCLUDED.flagged_reason;
+                """,(tid, amt, loc, dev, flagged, risk, reason))
 
-                # Insert into fraud_alerts if flagged
+                # insert only flagged into fraud_alerts
                 if flagged:
                     cur.execute("""
-                      INSERT INTO fraud_alerts
-                        (transaction_id, amount, risk_score, flagged_reason)
-                      VALUES (%s,%s,%s,%s)
-                      ON CONFLICT (transaction_id) DO NOTHING;
-                    """,(tid,amt,risk,reason))
-        print(f"Processed {len(df)} total transactions.")
+                        INSERT INTO fraud_alerts
+                            (transaction_id, amount, risk_score, flagged_reason)
+                        VALUES (%s,%s,%s,%s)
+                        ON CONFLICT (transaction_id) DO NOTHING;
+                    """,(tid, amt, risk, reason))
+
+        print(f"Processed {len(df)} transactions.")
     finally:
         conn.close()
 
-if __name__=="__
+if __name__ == "__main__":
+    main()
