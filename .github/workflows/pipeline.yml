@@ -1,13 +1,21 @@
-name: Run Fraud Pipeline
+name: Fraud Batch Pipeline
 
 on:
-  workflow_dispatch: {}
+  # 1. Manual runs
+  workflow_dispatch:
+
+  # 2. Periodic runs (every 15 minutes for demo, adjust as needed)
   schedule:
-    - cron: "0 0 * * *"
+    - cron: "*/15 * * * *"
+
+  # 3. Instant runs triggered by FastAPI (via GitHub API)
+  repository_dispatch:
+    types: [fraud-run]
 
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
+
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -23,4 +31,5 @@ jobs:
       - name: Run pipeline
         env:
           NEON_CONN: ${{ secrets.NEON_CONN }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
         run: python pipeline.py
