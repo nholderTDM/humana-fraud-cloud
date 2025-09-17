@@ -118,21 +118,31 @@ else:
 # 5) Fraud Alerts Over Time
 # -----------------------------
 st.subheader("Fraud Alerts Over Time")
+
 if not alerts_df.empty:
     tmp = alerts_df.copy()
     tmp["bucket"] = tmp["created_at"].dt.floor("H")
-    # rename the count column exactly as used in Altair encodings
-    grouped = tmp.groupby("bucket").size().reset_index(name="No. Transactions")
+
+    # Force a safe, lowercase column name for Altair
+    grouped = (
+        tmp.groupby("bucket")
+           .size()
+           .reset_index(name="no_transactions")
+    )
+    # Make sure it's numeric
+    grouped["no_transactions"] = grouped["no_transactions"].astype(int)
+
     chart = (
         alt.Chart(grouped)
         .mark_area()
         .encode(
             x=alt.X("bucket:T", title="Time"),
-            y=alt.Y("No. Transactions:Q", title="No. Transactions"),
+            y=alt.Y("no_transactions:Q", title="No. Transactions"),
             tooltip=[alt.Tooltip("bucket:T", title="Time"),
-                     alt.Tooltip("No. Transactions:Q", title="No. Transactions")],
+                     alt.Tooltip("no_transactions:Q", title="No. Transactions")],
         )
     )
+
     st.altair_chart(chart, use_container_width=True)
 else:
     st.caption("No fraud alerts yet to plot.")
