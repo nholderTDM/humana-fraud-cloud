@@ -1,88 +1,100 @@
 """
-pipeline.py (queue-aware)
--------------------------
-End-to-end fraud detection pipeline:
- • Connects to Neon Postgres using NEON_CONN (from GitHub Actions secret)
- • Ensures the fraud_alerts table exists (idempotent)
- • Optionally drains Redis queue (if REDIS_URL is set)
- • Loads transactions (CSV if present, else synthetic)
+pipeline.py
+-----------
+Fraud detection ETL that:
+ • Connects to Neon Postgres using NEON_CONN (from GitHub Actions secrets)
+ • Ensures fraud_alerts and transactions_all tables exist (idempotent)
+ • Drains Upstash Redis queue if REDIS_URL is set (consuming items)
+ • Loads CSV (if present) or generates synthetic transactions
  • Flags suspicious transactions (amount >= 10,000, risk_score=90)
- • Inserts alerts into the database using ON CONFLICT DO NOTHING
+ • Inserts:
+      – all transactions into transactions_all
+      – only flagged ones into fraud_alerts
 """
 
-import os
-import sys
-import time
-import json
+import os, sys, time, json
 from typing import List, Dict
 
+import pandas as pd
 import psycopg2
 import psycopg2.extras
-import pandas as pd
 
 
-# --- 1. Config ---------------------------------------------------------------
+# --------------------------------------------------------------------
+# 1. Configuration
+# --------------------------------------------------------------------
 NEON_CONN = os.getenv("NEON_CONN")
 if not NEON_CONN:
-    print("ERROR: NEON_CONN environment variable is missing.")
+    print("❌ Missing NEON_CONN environment variable.")
     sys.exit(1)
 
-CSV_PATH = "data/transactions_sample.csv"  # optional
-REDIS_URL = os.getenv("REDIS_URL")         # only needed if using the queue
+CSV_PATH  = "data/transactions_sample.csv"
+REDIS_URL = os.getenv("REDIS_URL")
 QUEUE_NAME = os.getenv("QUEUE_NAME", "transactions_queue")
 
 
-# --- 2. Database helpers ------------------------------------------------------
+# --------------------------------------------------------------------
+# 2. Database Helpers
+# --------------------------------------------------------------------
 def get_conn():
     return psycopg2.connect(NEON_CONN, sslmode="require")
 
 def ensure_schema(conn):
     with conn, conn.cursor() as cur:
+        # Fraud alerts table
         cur.execute("""
             CREATE TABLE IF NOT EXISTS fraud_alerts (
-              alert_id        SERIAL PRIMARY KEY,
-              transaction_id  TEXT                NOT NULL,
-              amount          DOUBLE PRECISION    NOT NULL,
-              risk_score      INT                 NOT NULL CHECK (risk_score BETWEEN 0 AND 100),
-              flagged_reason  TEXT                NOT NULL,
-              created_at      TIMESTAMP           DEFAULT CURRENT_TIMESTAMP
+                alert_id        SERIAL PRIMARY KEY,
+                transaction_id  TEXT UNIQUE NOT NULL,
+                amount          DOUBLE PRECISION NOT NULL,
+                risk_score      INT NOT NULL CHECK (risk_score BETWEEN 0 AND 100),
+                flagged_reason  TEXT NOT NULL,
+                created_at      TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
             );
         """)
+        # All processed transactions
         cur.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS ux_fraud_alerts_txn
-              ON fraud_alerts (transaction_id);
+            CREATE TABLE IF NOT EXISTS transactions_all (
+                transaction_id  TEXT PRIMARY KEY,
+                amount          DOUBLE PRECISION NOT NULL,
+                location        TEXT,
+                device          TEXT,
+                processed_at    TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                is_flagged      BOOLEAN NOT NULL,
+                risk_score      INT,
+                flagged_reason  TEXT
+            );
         """)
 
 
-# --- 3. Optional queue drain --------------------------------------------------
+# --------------------------------------------------------------------
+# 3. Optional Redis Queue Drain
+# --------------------------------------------------------------------
 def drain_queue() -> pd.DataFrame:
-    """Return a DataFrame of queued transactions, or empty DF if none or no REDIS_URL."""
+    """Consume and return queued transactions as a DataFrame."""
     if not REDIS_URL:
         return pd.DataFrame(columns=["transaction_id", "amount", "location", "device"])
 
-    print(f"Draining Redis queue '{QUEUE_NAME}'...")
-    import redis  # lazy import
+    import redis
     r = redis.from_url(REDIS_URL, decode_responses=True)
-    drained = []
-    # Drain up to a sensible cap per run to avoid huge batches on free tiers
+    drained: List[Dict] = []
     max_to_drain = 5000
     for _ in range(max_to_drain):
-        item = r.lpop(QUEUE_NAME)
+        item = r.lpop(QUEUE_NAME)  # removes item so queue does not grow forever
         if item is None:
             break
-        obj = json.loads(item)
-        drained.append(obj)
+        drained.append(json.loads(item))
 
-    print(f"Drained {len(drained)} queued transactions.")
-    if not drained:
-        return pd.DataFrame(columns=["transaction_id", "amount", "location", "device"])
+    print(f"Drained {len(drained)} transactions from Redis.")
     return pd.DataFrame(drained)
 
 
-# --- 4. Data loading ----------------------------------------------------------
+# --------------------------------------------------------------------
+# 4. Load Transactions
+# --------------------------------------------------------------------
 def load_file_or_synthetic() -> pd.DataFrame:
     if os.path.exists(CSV_PATH):
-        print(f"Loading transactions from {CSV_PATH}")
+        print(f"Loading sample transactions from {CSV_PATH}")
         df = pd.read_csv(CSV_PATH)
         required = {"transaction_id", "amount"}
         missing = required - set(df.columns)
@@ -90,12 +102,12 @@ def load_file_or_synthetic() -> pd.DataFrame:
             raise ValueError(f"CSV missing required columns: {missing}")
         return df
 
-    print("No CSV found. Generating synthetic transactions...")
+    # Generate synthetic demo data
     base_id = int(time.time())
     synthetic: List[Dict] = []
     for i in range(1, 51):
         tid = f"TXN{base_id + i}"
-        amt = 25 * i if i % 7 else 25000  # spike every 7th transaction
+        amt = 25 * i if i % 7 else 25000  # big spike every 7th
         loc = "USA" if i % 3 else "CAN"
         dev = "Web" if i % 2 else "Mobile"
         synthetic.append({
@@ -107,7 +119,9 @@ def load_file_or_synthetic() -> pd.DataFrame:
     return pd.DataFrame(synthetic)
 
 
-# --- 5. Fraud detection -------------------------------------------------------
+# --------------------------------------------------------------------
+# 5. Fraud Detection
+# --------------------------------------------------------------------
 def detect_fraud(df: pd.DataFrame) -> List[Dict]:
     alerts: List[Dict] = []
     for _, r in df.iterrows():
@@ -122,7 +136,60 @@ def detect_fraud(df: pd.DataFrame) -> List[Dict]:
     return alerts
 
 
-# --- 6. Insert alerts ---------------------------------------------------------
+# --------------------------------------------------------------------
+# 6. Database Inserts
+# --------------------------------------------------------------------
+def write_all_transactions(conn, df: pd.DataFrame, alerts: List[Dict]) -> None:
+    """
+    Insert every transaction into transactions_all.
+    Mark is_flagged, risk_score, and flagged_reason appropriately.
+    """
+    if df.empty:
+        return
+
+    alert_lookup = {a["transaction_id"]: a for a in alerts}
+    rows: List[Dict] = []
+    for _, r in df.iterrows():
+        tid = str(r["transaction_id"])
+        amt = float(r["amount"])
+        loc = r.get("location", None)
+        dev = r.get("device", None)
+        flagged = tid in alert_lookup
+        risk   = alert_lookup[tid]["risk_score"] if flagged else None
+        reason = alert_lookup[tid]["flagged_reason"] if flagged else None
+        rows.append({
+            "transaction_id": tid,
+            "amount": amt,
+            "location": loc,
+            "device": dev,
+            "is_flagged": flagged,
+            "risk_score": risk,
+            "flagged_reason": reason
+        })
+
+    with conn, conn.cursor() as cur:
+        psycopg2.extras.execute_batch(
+            cur,
+            """
+            INSERT INTO transactions_all
+              (transaction_id, amount, location, device,
+               is_flagged, risk_score, flagged_reason)
+            VALUES (%(transaction_id)s, %(amount)s, %(location)s, %(device)s,
+                    %(is_flagged)s, %(risk_score)s, %(flagged_reason)s)
+            ON CONFLICT (transaction_id) DO UPDATE
+              SET amount        = EXCLUDED.amount,
+                  location      = EXCLUDED.location,
+                  device        = EXCLUDED.device,
+                  processed_at  = CURRENT_TIMESTAMP,
+                  is_flagged    = EXCLUDED.is_flagged,
+                  risk_score    = EXCLUDED.risk_score,
+                  flagged_reason= EXCLUDED.flagged_reason;
+            """,
+            rows,
+            page_size=100
+        )
+
+
 def write_alerts(conn, alerts: List[Dict]) -> int:
     if not alerts:
         return 0
@@ -140,30 +207,36 @@ def write_alerts(conn, alerts: List[Dict]) -> int:
     return len(alerts)
 
 
-# --- 7. Main ------------------------------------------------------------------
+# --------------------------------------------------------------------
+# 7. Main ETL
+# --------------------------------------------------------------------
 def main():
     print("Connecting to Neon...")
     conn = get_conn()
     try:
-        print("Ensuring schema...")
+        print("Ensuring tables exist...")
         ensure_schema(conn)
 
-        # Drain queue first (if enabled), then merge with file/synthetic
+        print("Collecting transactions...")
         qdf = drain_queue()
         base = load_file_or_synthetic()
         df = pd.concat([qdf, base], ignore_index=True) if not qdf.empty else base
-        print(f"Total transactions to evaluate: {len(df)}")
+        print(f"Total transactions this run: {len(df)}")
 
-        print("Detecting fraud...")
+        print("Running fraud detection...")
         alerts = detect_fraud(df)
-        print(f"Detected {len(alerts)} alerts")
+        print(f"Flagged {len(alerts)} transactions.")
 
-        print("Writing alerts to database...")
+        print("Writing all transactions to database...")
+        write_all_transactions(conn, df, alerts)
+
+        print("Writing fraud alerts to database...")
         inserted = write_alerts(conn, alerts)
-        print(f"Inserted {inserted} new alerts (duplicates skipped).")
+        print(f"Inserted {inserted} new fraud alerts.")
     finally:
         conn.close()
-    print("Pipeline run complete.")
+
+    print("✅ Pipeline run complete.")
 
 
 if __name__ == "__main__":
